@@ -1,105 +1,267 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import './App.css';
+import firebase from 'firebase/app';
+import 'firebase/firestore';
+
+// Your web app's Firebase configuration
+var firebaseConfig = {
+  apiKey: process.env.REACT_APP_apiKey,
+  authDomain: process.env.REACT_APP_authDomain,
+  projectId: process.env.REACT_APP_projectId,
+  storageBucket: process.env.REACT_APP_storageBucket,
+  messagingSenderId: process.env.REACT_APP_messagingSenderId,
+  appId: process.env.REACT_APP_appId,
+};
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);
 
 function App() {
   const [hasPermissions, setHasPermission] = useState();
-  const [isUsingVideo, setIsUsingVideo] = useState(false);
-  const [currentStream, setCurrentStream] = useState();
-  const [isMuted, setIsMuted] = useState(false);
-  const [isVideoMuted, setIsVideoMuted] = useState(false);
-  const playerRef = useRef(null);
+  const [isCalling, setIsCalling] = useState(false);
+  const [localStream, setLocalStream] = useState();
+  const [remoteStream, setRemoteStream] = useState();
+  const [peerConnection, setPeerConnection] = useState();
+  const [currentState, setCurrentState] = useState('idle');
+  const [roomId, setRoomId] = useState();
+  const [callType, setCallType] = useState();
 
-  const handleStartVideo = () => {
-    setIsUsingVideo(true);
+  useEffect(() => {
+    if (
+      peerConnection &&
+      localStream &&
+      remoteStream &&
+      (currentState === 'waitingForLocalStream') &&
+      callType
+    ) {
+      setCurrentState('creatingRoom');
+
+      const joinOrCreateRoom = async () => {
+        const db = firebase.firestore();
+        const roomRef = callType === 'host' ?
+          await db.collection('rooms').doc() :
+          db.collection('rooms').doc(`${roomId}`);
+        let [localICECollectionName, remoteICECollectionName] = ['hostCandidates', 'joinerCandidates'];
+        let roomSnapshot;
+
+
+        if (callType === 'joiner') {
+          roomSnapshot = await roomRef.get();
+          if (!roomSnapshot.exists) {
+            setCurrentState('error');
+            return;
+          }
+
+          [remoteICECollectionName, localICECollectionName] = [localICECollectionName, remoteICECollectionName];
+        }
+
+        // Add tracks to local connection
+        localStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, localStream);
+        });
+
+        // Gather local ICE candidates
+        const localCandidatesCollection = roomRef.collection(localICECollectionName);
+        peerConnection.addEventListener('icecandidate', event => {
+          if (!event.candidate) {
+            return;
+          }
+          localCandidatesCollection.add(event.candidate.toJSON());
+        });
+
+        // Add tracks handler for remote stream
+        peerConnection.addEventListener('track', event => {
+          event.streams[0].getTracks().forEach(track => {
+            remoteStream.addTrack(track);
+          });
+        });
+
+        // Create offer
+        if (callType === 'host') {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+
+          const roomWithOffer = {
+            'offer': {
+              type: offer.type,
+              sdp: offer.sdp,
+            },
+          };
+          await roomRef.set(roomWithOffer);
+          setRoomId(roomRef.id);
+
+          // Handler for answer
+          roomRef.onSnapshot(async snapshot => {
+            const data = snapshot.data();
+            if (!peerConnection.currentRemoteDescription && data && data.answer) {
+              const rtcSessionDescription = new RTCSessionDescription(data.answer);
+              await peerConnection.setRemoteDescription(rtcSessionDescription);
+            }
+          });
+        } else {
+          // Create answer
+          const offer = roomSnapshot.data().offer;
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+
+          const roomWithAnswer = {
+            answer: {
+              type: answer.type,
+              sdp: answer.sdp,
+            },
+          };
+          await roomRef.update(roomWithAnswer);
+        }
+
+        // Handler for remote ICE candidates
+        roomRef.collection(remoteICECollectionName).onSnapshot(snapshot => {
+          snapshot.docChanges().forEach(async change => {
+            if (change.type === 'added') {
+              let data = change.doc.data();
+              await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+            }
+          });
+        });
+
+        setCurrentState('ready');
+      };
+
+      try {
+        joinOrCreateRoom();
+      } catch {
+        setCurrentState('error');
+      }
+    }
+  }, [callType, currentState, localStream, peerConnection, remoteStream, roomId]);
+
+  const handleStartVideo = (type = 'host') => {
+    setCallType(type);
+    setIsCalling(true);
     navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
     }).then(stream => {
-      console.log('got stream', stream);
-      setCurrentStream(stream);
+      setLocalStream(stream);
       setHasPermission(true);
     }).catch(error => {
-      console.log('Media access error', error);
       setHasPermission(false);
     });
+
+    setRemoteStream(new MediaStream());
+
+    createPeerConnection();
   };
 
-  const handleStopVideo = () => {
-    setIsUsingVideo(false);
-    currentStream.getTracks().forEach(track => {
+  const createPeerConnection = () => {
+    const peerConnectionNew = new RTCPeerConnection({
+      iceServers: [
+        {
+          urls: [
+            process.env.REACT_APP_SERVER_1,
+            process.env.REACT_APP_SERVER_2,
+          ].filter(Boolean),
+          iceCandidatePoolSize: 10,
+        }
+      ]
+    });
+
+    setPeerConnection(peerConnectionNew);
+    setCurrentState('waitingForLocalStream');
+  };
+
+  const handleStopVideo = async () => {
+    setIsCalling(false);
+    localStream.getTracks().forEach(track => {
       if (track.readyState === 'live') {
         track.stop();
       }
     });
-    setCurrentStream(null);
+    setLocalStream(null);
+
+    if (remoteStream) {
+      remoteStream.getTracks().forEach(track => track.stop());
+    }
+    setRemoteStream(null);
+
+    if (peerConnection) {
+      peerConnection.close();
+    }
+    setPeerConnection(null);
+
+    // Delete room on hangup
+    if (callType === 'host') {
+      const db = firebase.firestore();
+      const roomRef = db.collection('rooms').doc(roomId);
+      const hostCandidates = await roomRef.collection('joinerCandidates').get();
+      hostCandidates.forEach(async candidate => {
+        await candidate.ref.delete();
+      });
+      const joinerCandidates = await roomRef.collection('hostCandidates').get();
+      joinerCandidates.forEach(async candidate => {
+        await candidate.ref.delete();
+      });
+      await roomRef.delete();
+      setRoomId(null);
+    }
+
+    setCallType(null);
+    setCurrentState('idle');
   };
 
-  const handleMute = () => {
-    const tracks = currentStream.getAudioTracks();
-    if (tracks.length > 0) {
-      const track = tracks[0];
-      track.enabled = false;
-      setIsMuted(true);
+  // Show local stream video
+  const setLocalStreamRef = useCallback(node => {
+    if (node && isCalling && localStream) {
+      node.srcObject = localStream;
     }
-  };
+  }, [isCalling, localStream]);
 
-  const handleDisableVideo = () => {
-    const tracks = currentStream.getVideoTracks();
-    if (tracks.length > 0) {
-      const track = tracks[0];
-      track.enabled = false;
-      setIsVideoMuted(true);
+  // Show remote stream video
+  const setRemoteStreamRef = useCallback(node => {
+    if (node && isCalling && remoteStream) {
+      node.srcObject = remoteStream;
     }
-  };
-
-  const handleUnMute = () => {
-    const tracks = currentStream.getAudioTracks();
-    if (tracks.length > 0) {
-      const track = tracks[0];
-      track.enabled = true;
-      setIsMuted(false);
-    }
-  };
-
-  const handleReEnableVideo = () => {
-    const tracks = currentStream.getVideoTracks();
-    if (tracks.length > 0) {
-      const track = tracks[0];
-      track.enabled = true;
-      setIsVideoMuted(false);
-    }
-  };
-
-  useEffect(() => {
-    if (playerRef.current && !playerRef.current.srcObject && isUsingVideo && currentStream) {
-      playerRef.current.srcObject = currentStream;
-    }
-  }, [currentStream, isUsingVideo, playerRef]);
+  }, [isCalling, remoteStream]);
 
   return (
     <div>
       <div>
         {
-          isUsingVideo ?
+          isCalling ?
             <>
               {
-                currentStream &&
-                <button onClick={handleStopVideo}>Stop video</button>
+                localStream &&
+                <button onClick={handleStopVideo}>End call</button>
               }
             </> :
-            <button onClick={handleStartVideo}>Start video</button>
+            <div>
+              <button onClick={() => { handleStartVideo('host') }}>Start call</button>
+              <button onClick={() => { handleStartVideo('joiner') }}
+                disabled={[null, undefined, ''].includes(roomId)}
+              >
+                Join call
+              </button>
+              <input type="text" placeholder="Enter room ID"
+                value={roomId || ''}
+                onChange={(event) => { setRoomId(event.target.value) }}
+              />
+            </div>
         }
 
 
       </div>
       {
-        isUsingVideo &&
+        isCalling &&
         <>
           {(typeof hasPermissions === 'boolean') ?
             <div>
               {
                 hasPermissions ?
-                  'Audio and video is ready' :
+                  <>
+                    {roomId ?
+                      'Room ID: ' + roomId :
+                      'Creating room...'
+                    }
+                  </> :
                   'App will require audio and video permissions to function properly'
               }
             </div> :
@@ -110,20 +272,29 @@ function App() {
         </>
       }
 
-      {isUsingVideo && currentStream &&
-        <div>
-          Video:
-          <video id="localVideo" autoPlay playsInline ref={playerRef} style={{ transform: 'scaleX(-1)' }} />
-          <div>
-            {isMuted ?
-              <button onClick={handleUnMute}>Unmute</button> :
-              <button onClick={handleMute}>Mute</button>
-            }
-            {isVideoMuted ?
-              <button onClick={handleReEnableVideo}>Enable Video</button> :
-              <button onClick={handleDisableVideo}>Disable Video</button>
-            }
-          </div>
+      {isCalling && localStream && remoteStream &&
+        <div style={{
+          display: 'flex',
+          flexDirection: 'row',
+          flexWrap: 'wrap',
+        }}>
+          <video id="localVideo" autoPlay playsInline ref={setLocalStreamRef}
+            style={{
+              background: 'black',
+              width: '640px',
+              height: '100%',
+              display: 'block',
+              margin: '1em',
+              transform: 'scaleX(-1)',
+            }} />
+          <video id="remoteVideo" autoPlay playsInline ref={setRemoteStreamRef}
+            style={{
+              background: 'black',
+              width: '640px',
+              height: '100%',
+              display: 'block',
+              margin: '1em',
+            }} />
         </div>
       }
     </div>
