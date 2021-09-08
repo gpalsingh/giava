@@ -180,6 +180,8 @@ function App() {
 
   const handleStopVideo = async () => {
     setIsCalling(false);
+    const prevRoomId = roomId;
+
     localStream.getTracks().forEach(track => {
       if (track.readyState === 'live') {
         track.stop();
@@ -199,8 +201,9 @@ function App() {
 
     // Delete room on hangup
     if (callType === 'host') {
+      setRoomId(null);
       const db = firebase.firestore();
-      const roomRef = db.collection('rooms').doc(roomId);
+      const roomRef = db.collection('rooms').doc(prevRoomId);
       const hostCandidates = await roomRef.collection('joinerCandidates').get();
       hostCandidates.forEach(async candidate => {
         await candidate.ref.delete();
@@ -210,7 +213,6 @@ function App() {
         await candidate.ref.delete();
       });
       await roomRef.delete();
-      setRoomId(null);
     }
 
     setCallType(null);
