@@ -286,7 +286,8 @@ function App() {
               display: 'block',
               margin: '1em',
               transform: 'scaleX(-1)',
-            }} />
+            }}
+          />
           <video id="remoteVideo" autoPlay playsInline ref={setRemoteStreamRef}
             style={{
               background: 'black',
@@ -294,7 +295,8 @@ function App() {
               height: '100%',
               display: 'block',
               margin: '1em',
-            }} />
+            }}
+          />
         </div>
       }
     </div>
