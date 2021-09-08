@@ -241,7 +241,11 @@ function App() {
             <>
               {
                 localStream &&
-                <button onClick={handleStopVideo}>End call</button>
+                <div>
+                  <button onClick={handleStopVideo}>{
+                    callType === 'host' ? 'End' : 'Leave'
+                  } call</button>
+                </div>
               }
             </> :
             <div>
