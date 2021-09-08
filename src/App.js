@@ -25,6 +25,36 @@ function App() {
   const [roomId, setRoomId] = useState();
   const [callType, setCallType] = useState();
 
+  const createAnswer = useCallback(async (roomSnapshot, roomRef) => {
+    const offer = roomSnapshot.data().offer;
+    console.log('setting remote description');
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+
+    const roomWithAnswer = {
+      answer: {
+        type: answer.type,
+        sdp: answer.sdp,
+      },
+    };
+    await roomRef.update(roomWithAnswer);
+  }, [peerConnection]);
+
+  const createOffer = useCallback(async (roomRef) => {
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+
+    const roomWithOffer = {
+      'offer': {
+        type: offer.type,
+        sdp: offer.sdp,
+      },
+    };
+
+    await roomRef.set(roomWithOffer);
+  }, [peerConnection]);
+
   useEffect(() => {
     if (
       peerConnection &&
@@ -77,16 +107,7 @@ function App() {
 
         // Create offer
         if (callType === 'host') {
-          const offer = await peerConnection.createOffer();
-          await peerConnection.setLocalDescription(offer);
-
-          const roomWithOffer = {
-            'offer': {
-              type: offer.type,
-              sdp: offer.sdp,
-            },
-          };
-          await roomRef.set(roomWithOffer);
+          await createOffer(roomRef);
           setRoomId(roomRef.id);
 
           // Handler for answer
@@ -98,19 +119,7 @@ function App() {
             }
           });
         } else {
-          // Create answer
-          const offer = roomSnapshot.data().offer;
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
-
-          const roomWithAnswer = {
-            answer: {
-              type: answer.type,
-              sdp: answer.sdp,
-            },
-          };
-          await roomRef.update(roomWithAnswer);
+          await createAnswer(roomSnapshot, roomRef);
         }
 
         // Handler for remote ICE candidates
@@ -132,7 +141,7 @@ function App() {
         setCurrentState('error');
       }
     }
-  }, [callType, currentState, localStream, peerConnection, remoteStream, roomId]);
+  }, [callType, createAnswer, createOffer, currentState, localStream, peerConnection, remoteStream, roomId]);
 
   const handleStartVideo = (type = 'host') => {
     setCallType(type);
